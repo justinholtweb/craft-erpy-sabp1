@@ -27,6 +27,7 @@ use justinholtweb\erpy\models\canonical\ErpPrice;
 use justinholtweb\erpy\models\canonical\ErpProduct;
 use justinholtweb\erpy\models\canonical\ErpShipment;
 use justinholtweb\erpy\models\canonical\ErpStock;
+use justinholtweb\erpysapb1\transport\ServiceLayerTransport;
 
 /**
  * SAP Business One, through the Service Layer.
@@ -44,9 +45,19 @@ use justinholtweb\erpy\models\canonical\ErpStock;
  * only ever be day-granular. This connector therefore asks for everything changed on or after the
  * watermark's *date*, and lets Erpy's content hashing discard the rest — re-reading a day's items
  * is cheap; missing an afternoon's price change is not.
+ *
+ * Two smaller things. An on-premise Service Layer often has a self-signed certificate; the
+ * setting for it is honoured by `ServiceLayerTransport`, on both the session login and every
+ * request after it. And contract pricing is B1's `SpecialPrices` table only. Price lists other
+ * than the base one are not synced, so a business partner whose B1 price list differs from the
+ * base list sees base prices on the storefront unless they also have Special Prices — and the
+ * order goes to B1 at the price the storefront charged.
  */
 class SapBusinessOneConnector extends Connector
 {
+    /** The auth strategy whose login transport has already been given the certificate setting. */
+    private ?AuthInterface $preparedAuth = null;
+
     public static function handle(): string
     {
         return 'sap-business-one';
@@ -110,13 +121,13 @@ class SapBusinessOneConnector extends Connector
             ]),
             Field::text('priceListNum', Craft::t('erpy', 'Base price list number'), [
                 'default' => '1',
-                'instructions' => Craft::t('erpy', 'The list whose prices become the Commerce base price. Other lists are treated as contract pricing.'),
+                'instructions' => Craft::t('erpy', 'The list whose prices become the Commerce base price. Other B1 price lists are not synced; customer-specific prices come from Special Prices for Business Partners.'),
             ]),
             Field::text('seriesNumber', Craft::t('erpy', 'Document series'), [
                 'instructions' => Craft::t('erpy', 'The numbering series new sales orders use. Leave blank for the default.'),
             ]),
             Field::boolean('ignoreSslErrors', Craft::t('erpy', 'This Service Layer uses a self-signed certificate'), [
-                'instructions' => Craft::t('erpy', 'Leave off unless you know it does. It usually means an on-premise install that has never had a real certificate.'),
+                'instructions' => Craft::t('erpy', 'Turns off certificate verification for this connection only — the login and every request. Leave off unless you know it does: it usually means an on-premise install that has never had a real certificate, and a real one is the better fix.'),
                 'default' => false,
             ]),
         ];
@@ -167,9 +178,36 @@ class SapBusinessOneConnector extends Connector
         );
     }
 
+    /**
+     * Erpy gives the session strategy a plain transport of its own for `/Login` and `/Logout`.
+     * On a self-signed Service Layer that one has to skip certificate verification too, or the
+     * login fails before any request that would have skipped it is made. It is swapped once per
+     * strategy, so a test double installed afterwards is left alone.
+     */
+    public function auth(): ?AuthInterface
+    {
+        $auth = parent::auth();
+
+        if ($auth !== null && $auth !== $this->preparedAuth) {
+            $this->preparedAuth = $auth;
+
+            if ($this->boolSetting('ignoreSslErrors') && method_exists($auth, 'setTransport')) {
+                $auth->setTransport(
+                    (new ServiceLayerTransport())
+                        ->skipCertificateCheck()
+                        ->setConnection($this->connection)
+                        ->setSecretValues($this->secretValues()),
+                );
+            }
+        }
+
+        return $auth;
+    }
+
     protected function buildTransport(): Transport
     {
-        return (new Transport())
+        return (new ServiceLayerTransport())
+            ->skipCertificateCheck($this->boolSetting('ignoreSslErrors'))
             ->setBaseUri($this->baseUrl())
             ->setDefaultHeaders([
                 'Accept' => 'application/json',
@@ -452,7 +490,7 @@ class SapBusinessOneConnector extends Connector
 
         // B1 has no idempotency key, so the customer reference number does the job. It is indexed
         // and it is what a merchant will search for when asked "did this order arrive?".
-        $existing = $this->findOrder($document->orderNumber);
+        $existing = $this->findOrder($this->numAtCard($document->orderNumber));
 
         if ($existing !== null && $remoteId === null) {
             return PushResult::alreadyExists((string)($existing['DocEntry'] ?? ''), (string)($existing['DocNum'] ?? ''));
@@ -474,7 +512,7 @@ class SapBusinessOneConnector extends Connector
 
         $payload = array_filter([
             'CardCode' => $document->customerCode,
-            'NumAtCard' => mb_substr($document->orderNumber, 0, 100),
+            'NumAtCard' => $this->numAtCard($document->orderNumber),
             'DocDate' => ($document->orderedAt ?? new DateTime())->format('Y-m-d'),
             'DocDueDate' => ($document->requestedDeliveryAt ?? $document->orderedAt ?? new DateTime())->format('Y-m-d'),
             'DocCurrency' => $document->currency,
@@ -513,21 +551,41 @@ class SapBusinessOneConnector extends Connector
         );
     }
 
-    private function findOrder(string $orderNumber): ?array
+    /**
+     * The value written to `NumAtCard`, looked up by a retry and compared against what comes
+     * back: the Commerce number, cut to the field's 100 characters.
+     */
+    private function numAtCard(string $orderNumber): string
     {
-        if ($orderNumber === '') {
+        return mb_substr($orderNumber, 0, 100);
+    }
+
+    /**
+     * The order already carrying this `NumAtCard`, or null. Every returned row is compared as
+     * well as filtered for: a Service Layer that ignores or mis-applies `$filter` must not turn
+     * every order after the first into a duplicate of whatever it returned.
+     */
+    private function findOrder(string $numAtCard): ?array
+    {
+        if ($numAtCard === '') {
             return null;
         }
 
         $response = $this->transport()->get('Orders', [
-            '$filter' => "NumAtCard eq '" . $this->escape($orderNumber) . "'",
+            '$filter' => "NumAtCard eq '" . $this->escape($numAtCard) . "'",
             '$select' => 'DocEntry,DocNum,NumAtCard',
-            '$top' => 1,
+            '$top' => 20,
         ]);
 
         $rows = $response->ok() ? $response->at('value', []) : [];
 
-        return $rows[0] ?? null;
+        foreach (is_array($rows) ? $rows : [] as $row) {
+            if (is_array($row) && (string)($row['NumAtCard'] ?? '') === $numAtCard) {
+                return $row;
+            }
+        }
+
+        return null;
     }
 
     // ---------------------------------------------------------------------------------------

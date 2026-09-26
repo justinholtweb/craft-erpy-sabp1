@@ -15,6 +15,7 @@
         "integration"
     ],
     "license": "proprietary",
+    "homepage": "https://justinholt.com/plugins/craft-erpy",
     "authors": [
         {
             "name": "Justin Holt",
@@ -22,7 +23,10 @@
         }
     ],
     "support": {
-        "email": "justin@justinholt.com"
+        "email": "justin@justinholt.com",
+        "docs": "https://justinholt.com/plugins/craft-erpy/docs/sap-business-one",
+        "source": "https://github.com/justinholtweb/craft-erpy-sapb1",
+        "issues": "https://github.com/justinholtweb/craft-erpy-sapb1/issues"
     },
     "minimum-stability": "stable",
     "prefer-stable": true,
@@ -47,7 +51,7 @@
         "handle": "erpy-sapb1",
         "developer": "Justin Holt",
         "developerUrl": "https://justinholt.com",
-        "documentationUrl": "https://github.com/justinholtweb/craft-erpy-sapb1/blob/main/README.md",
+        "documentationUrl": "https://justinholt.com/plugins/craft-erpy/docs/sap-business-one",
         "changelogUrl": "https://raw.githubusercontent.com/justinholtweb/craft-erpy-sapb1/main/CHANGELOG.md",
         "class": "justinholtweb\\erpysapb1\\Plugin"
     }
